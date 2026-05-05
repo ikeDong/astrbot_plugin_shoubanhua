@@ -483,6 +483,8 @@ class ApiManager:
         """判断 Images API 是否需要回退为 multipart/form-data 方式"""
         if not has_input_image:
             return False
+        if self._is_images_edits_unsupported_error(error_msg):
+            return False
         error_lower = (error_msg or "").lower()
         keywords = [
             "multipart",
@@ -493,6 +495,23 @@ class ApiManager:
             "use multipart",
             "expected uploadfile",
             "expected file"
+        ]
+        return any(keyword in error_lower for keyword in keywords)
+
+    def _is_images_edits_unsupported_error(self, error_msg: str) -> bool:
+        """Detect providers that do not implement /images/edits at all."""
+        error_lower = (error_msg or "").lower()
+        keywords = [
+            "images/edits",
+            "image edits",
+            "not support this api",
+            "api not supported",
+            "unsupported endpoint",
+            "unsupported api",
+            "暂不支持该接口",
+            "不支持该接口",
+            "该接口暂不支持",
+            "接口不支持",
         ]
         return any(keyword in error_lower for keyword in keywords)
 
@@ -533,21 +552,21 @@ class ApiManager:
         timeout = aiohttp.ClientTimeout(total=timeout_val)
         session = await self._get_session()
 
-        form = aiohttp.FormData()
-        form.add_field("model", model)
-        form.add_field("prompt", final_prompt)
-        form.add_field("n", "1")
-        form.add_field("response_format", "b64_json")
-
-        if images:
-            img = images[0]
-            mime = self.get_mime_type(img)
-            ext = mime.split("/")[-1] if "/" in mime else "png"
-            filename = f"input.{ext}"
-            form.add_field("image", img, filename=filename, content_type=mime)
-
         try:
             for idx, url in enumerate(candidate_urls):
+                form = aiohttp.FormData()
+                form.add_field("model", model)
+                form.add_field("prompt", final_prompt)
+                form.add_field("n", "1")
+                form.add_field("response_format", "b64_json")
+
+                if images:
+                    img = images[0]
+                    mime = self.get_mime_type(img)
+                    ext = mime.split("/")[-1] if "/" in mime else "png"
+                    filename = f"input.{ext}"
+                    form.add_field("image", img, filename=filename, content_type=mime)
+
                 current_proxy = self._get_request_proxy(url, proxy)
                 async with session.post(url, data=form, headers=headers, proxy=current_proxy, timeout=timeout) as resp:
                     resp_text = await resp.text()
@@ -560,8 +579,18 @@ class ApiManager:
                         try:
                             err_json = json.loads(resp_text)
                             err_msg = json.dumps(err_json, ensure_ascii=False)
+                            if has_input_image and self._is_images_edits_unsupported_error(err_msg):
+                                if idx < len(candidate_urls) - 1:
+                                    logger.warning(f"Images API multipart edits endpoint unsupported, trying next candidate: {candidate_urls[idx + 1]}")
+                                    continue
+                                return f"Images API edits endpoint unsupported {resp.status}: {err_msg} | URL: {url}"
                             return f"Images API Multipart Error {resp.status}: {err_msg} | URL: {url}"
                         except:
+                            if has_input_image and self._is_images_edits_unsupported_error(resp_text):
+                                if idx < len(candidate_urls) - 1:
+                                    logger.warning(f"Images API multipart edits endpoint unsupported, trying next candidate: {candidate_urls[idx + 1]}")
+                                    continue
+                                return f"Images API edits endpoint unsupported {resp.status}: {resp_text[:300]} | URL: {url}"
                             return f"HTTP {resp.status}: {resp_text[:200]} | URL: {url}"
 
                     if "<html" in resp_text.lower():
@@ -639,6 +668,12 @@ class ApiManager:
                                 err_msg = json.dumps(err_json, ensure_ascii=False)
                         except:
                             pass
+
+                        if has_input_image and self._is_images_edits_unsupported_error(err_msg):
+                            if idx < len(candidate_urls) - 1:
+                                logger.warning(f"Images API edits endpoint unsupported, trying next candidate: {candidate_urls[idx + 1]}")
+                                continue
+                            return f"Images API edits endpoint unsupported {resp.status}: {err_msg[:300]} | URL: {url}"
 
                         if self._should_retry_images_api_with_multipart(err_msg, has_input_image):
                             logger.info("Images API JSON 请求失败，检测到服务端更偏好 multipart/form-data，自动重试")
@@ -940,7 +975,14 @@ class ApiManager:
         if mode == "generic" and self.config.get("generic_prefer_images_api", False):
             if len(images) <= 1:
                 logger.info("已启用 generic_prefer_images_api，优先直接走 Images API")
-                return await self.call_images_api(images, prompt, model, key, base, proxy)
+                image_api_result = await self.call_images_api(images, prompt, model, key, base, proxy)
+                if not (
+                        images
+                        and isinstance(image_api_result, str)
+                        and self._is_images_edits_unsupported_error(image_api_result)
+                ):
+                    return image_api_result
+                logger.warning("Preferred Images API edits endpoint is unsupported; falling back to chat/completions.")
             logger.info(
                 "generic_prefer_images_api 已启用，但检测到多图输入，"
                 "为保留全部参考图改走 chat/completions"
@@ -1345,4 +1387,3 @@ class ApiManager:
                 err_msg = type(e).__name__
             
             return f"系统错误: {err_msg}"
- 

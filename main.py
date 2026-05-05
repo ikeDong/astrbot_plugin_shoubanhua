@@ -103,7 +103,7 @@ _CLOTHING_KEYWORDS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.8.3",
+    "2.8.4",
     "https://github.com/shskjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -578,14 +578,13 @@ class FigurineProPlugin(Star):
                 skipped_count = 0
 
                 for k, v in dynamic_conf.items():
-                    # 仅在当前配置缺失或为空时，才从 dynamic_config.json 回填。
-                    # 这样可以避免用户手动修改主配置文件后，在重载时又被旧备份覆盖回去。
+                    # 仅在当前配置完全缺失时才从 dynamic_config.json 回填。
+                    # 如果用户把主 JSON 配置项清空，空值本身也是一次明确配置，不能再被旧备份覆盖。
                     if v is None or v == "" or v == [] or v == {}:
                         skipped_count += 1
                         continue
 
-                    current_value = self.conf.get(k, None)
-                    if current_value is None or current_value == "" or current_value == [] or current_value == {}:
+                    if k not in self.conf:
                         self.conf[k] = v
                         restored_count += 1
                     else:
@@ -826,31 +825,122 @@ class FigurineProPlugin(Star):
             return False
 
         compact = re.sub(r"\s+", "", text)
-        explicit_phrases = [
-            "发你的自拍", "发你自拍", "你的自拍", "看你自拍", "发你的照片", "发你照片",
-            "你的照片", "看你照片", "看看你", "看看你长啥样", "看看你长什么样",
-            "你长啥样", "你长什么样", "你的写真", "写真集", "私房照", "营业照",
-            "自拍照", "露脸照", "发几张你", "来几张你", "发张你", "来张你",
-            "你本人", "你自己的照片", "看看你本人", "发我看看你", "让我看看你",
-            "发我看看你现在在做什么", "看看你现在在做什么", "看看你在做什么",
-            "想看你", "给我看看你",
-            # 用户省略"你的"直接说"看看自拍/来张自拍"等，也视为请求Bot本人照片
-            "看看自拍", "来张自拍", "发张自拍", "来一张自拍", "来几张自拍",
-            "看你的自拍", "拍张照", "来张照片", "发张照片",
+
+        bot_terms = [
+            "你", "你的", "你自己", "你本人", "本人", "bot", "机器人", "助手",
+            "小助手", "本体", "本尊", "看板娘"
         ]
-        if any(phrase in compact for phrase in explicit_phrases):
+        selfie_terms = [
+            "自拍", "自拍照", "自拍图", "自拍一张", "自拍几张", "自拍看看",
+            "拍自己", "自己拍", "对镜拍", "镜子自拍", "前置摄像头"
+        ]
+        photo_terms = [
+            "照片", "相片", "照骗", "写真", "写真集", "私房照", "营业照",
+            "生活照", "日常照", "近照", "全身照", "半身照", "头像照",
+            "证件照", "露脸照", "图", "图片"
+        ]
+        appearance_terms = [
+            "露脸", "露脸看看", "脸", "脸蛋", "样子", "模样", "外貌", "长相",
+            "长啥样", "长什么样", "身材", "发型", "衣服", "穿搭", "装扮"
+        ]
+        request_terms = [
+            "发", "拍", "来", "给我", "给我看", "给我看看", "发我", "发给我",
+            "拍给我", "让我看", "让我看看", "看看", "看下", "看一下", "看一眼",
+            "想看", "要看", "瞅瞅", "康康", "整", "弄", "展示", "营业", "出镜"
+        ]
+        style_show_terms = [
+            "cos", "cosplay", "扮演", "角色扮演", "换装", "换衣", "换套衣服",
+            "穿", "穿上", "穿着", "换一套", "换一身", "试穿", "女仆装",
+            "制服", "校服", "jk", "lo裙", "洛丽塔", "旗袍", "汉服", "和服",
+            "泳装", "婚纱", "礼服", "西装", "抱着", "抱住", "拿着", "举着",
+            "戴着", "坐着", "站着", "躺着", "趴着", "靠着", "摆姿势", "摆个姿势",
+            "比心", "wink", "眨眼", "微笑", "嘟嘴", "卖萌", "合影", "同框"
+        ]
+        reference_terms = [
+            "上面", "上图", "上一张", "刚才", "刚刚", "前面", "这张", "这图",
+            "这个图", "这照片", "图片", "照片", "参考图", "参考", "图里",
+            "图片里", "照片里", "这个人", "那个人", "同款", "照着", "按这个"
+        ]
+        generation_terms = [
+            "画", "画一", "画个", "画张", "生成", "创作", "设计", "绘制", "做一张",
+            "出一张", "文生图", "生成图", "画图"
+        ]
+        third_party_subject_terms = [
+            "一个女孩", "一个男孩", "一个人", "某个人", "路人", "陌生人", "角色图",
+            "oc", "原神角色", "动漫角色", "游戏角色", "女孩抱着", "男孩抱着"
+        ]
+        sending_to_bot_terms = [
+            "我发给你", "我给你发", "我传给你", "给你看", "发你看", "给你一张",
+            "我拍给你", "我发张", "我发个"
+        ]
+
+        has_bot = any(term in compact for term in bot_terms if term != "本人")
+        if "本人" in compact and not any(term in compact for term in ["我本人", "用户本人", "自己本人"]):
+            has_bot = True
+        has_selfie = any(term in compact for term in selfie_terms)
+        has_photo = any(term in compact for term in photo_terms)
+        has_appearance = any(term in compact for term in appearance_terms)
+        has_request = any(term in compact for term in request_terms)
+        has_style_show = any(term in compact for term in style_show_terms)
+        has_reference = any(term in compact for term in reference_terms)
+        has_generation = any(term in compact for term in generation_terms)
+        has_third_party_subject = any(term in compact for term in third_party_subject_terms)
+        is_sending_image_to_bot = any(term in compact for term in sending_to_bot_terms)
+        explicit_bot_target = any(term in compact for term in [
+            "你的", "你自己", "你本人", "bot", "机器人", "助手", "小助手", "本体", "本尊", "看板娘"
+        ])
+
+        if is_sending_image_to_bot and not explicit_bot_target:
+            return False
+
+        bot_intent_patterns = [
+            r"(发|拍|来|给我|让我|想看|看看|看下|瞅瞅|康康).{0,8}(你|你的|你自己|你本人|本人|bot|机器人|助手)",
+            r"(你|你的|你自己|你本人|本人|bot|机器人|助手).{0,10}(自拍|照片|相片|写真|露脸|样子|长相|外貌|穿搭|换装|cos)",
+            r"(看看|看下|想看).{0,6}(你|你现在|你今天|你在干嘛|你在做什么)",
+        ]
+        has_bot_pattern = any(re.search(pattern, compact) for pattern in bot_intent_patterns)
+
+        # “自拍”天然指向说话对象本人，即使用户省略“你/你的”，也应使用人设参考图。
+        if has_selfie and (has_request or has_style_show or has_photo):
+            return True
+
+        # 明确指向 Bot/本人，并要求看外貌、照片、写真、穿搭或当前状态。
+        if (
+                has_bot_pattern
+                or (
+                    has_bot
+                    and (has_appearance or has_selfie or has_style_show or (has_photo and not has_generation))
+                )
+        ):
+            return True
+
+        # “拍照/发照/来张照片”没有其它主体时，在人设模式中按 Bot 本人照片处理。
+        if (
+                has_photo and has_request
+                and not has_generation
+                and not has_third_party_subject
+                and not is_sending_image_to_bot
+        ):
             return True
 
         configured_keywords = self._get_persona_trigger_keywords()
         if configured_keywords and any(kw in compact for kw in configured_keywords):
-            if any(term in compact for term in ["你", "你的", "本人", "自拍", "照片", "写真", "看看"]):
+            if has_bot or has_selfie or has_photo or has_appearance or has_request or has_style_show:
                 return True
 
-        self_terms = ["你", "你的", "你自己", "你本人", "本人"]
-        photo_terms = ["自拍", "照片", "写真", "写真集", "私房照", "相片", "样子", "长啥样", "长什么样", "露脸"]
-        has_self = any(term in compact for term in self_terms)
-        has_photo = any(term in compact for term in photo_terms)
-        return has_self and has_photo
+        # “cos/换装/抱着某物/摆姿势给我看”是展示 Bot 人设的新照片，而不是纯文生图。
+        if (
+                has_style_show and has_request
+                and not has_generation
+                and not (has_third_party_subject and not any(term in compact for term in ["cos", "cosplay", "扮演"]))
+        ):
+            return True
+
+        # 对最近/上面图片发起合影请求时，保留 Bot 人设作为主体，图片里的人作为合影对象。
+        if any(term in compact for term in ["合影", "同框", "一起拍", "一起照"]) and has_reference:
+            return True
+
+        return False
 
     def _looks_like_persona_followup_request(self, message: str, context_messages: List[Any]) -> bool:
         """识别依赖上下文的“看看/发我看看”类追问。"""
@@ -861,7 +951,10 @@ class FigurineProPlugin(Star):
         compact = re.sub(r"\s+", "", text)
         followup_keywords = [
             "看看", "看下", "看一眼", "来一张", "来张", "发来", "发我看看",
-            "给我看看", "让我看看", "照片呢", "图呢", "自拍呢", "快发", "快看看"
+            "给我看看", "让我看看", "照片呢", "图呢", "自拍呢", "快发", "快看看",
+            "发呀", "发啊", "快拍", "拍呀", "拍啊", "来点", "多来点", "再来一张",
+            "再拍一张", "换一张", "换个姿势", "换个角度", "换套衣服", "换装看看",
+            "穿上看看", "cos看看", "合影呢", "同框呢", "上图那个呢"
         ]
         if compact not in followup_keywords and not any(kw == compact or kw in compact for kw in followup_keywords):
             return False
@@ -873,7 +966,9 @@ class FigurineProPlugin(Star):
         persona_request_markers = [
             "看看你", "看看你现在在做什么", "你现在在做什么", "发我看看你现在在做什么",
             "你的自拍", "看你自拍", "发你的照片", "你长啥样", "你长什么样",
-            "写真", "自拍", "照片", "看看自拍"
+            "写真", "自拍", "照片", "看看自拍", "露脸", "看脸", "长相", "外貌",
+            "换装", "换衣", "穿搭", "cos", "扮演", "合影", "同框", "拍照",
+            "生活照", "日常照", "营业照", "私房照"
         ]
 
         for msg in reversed(recent_messages):
@@ -2150,7 +2245,7 @@ class FigurineProPlugin(Star):
         '''根据文本描述生成图片（文生图）。
 
         【排他性条件（极度重要！）】
-        - 如果用户是向你要**你自己的**照片（例如："发你的自拍"、"看看自拍"、"来张自拍"、"你的私房照"、"看看你长啥样"），【严禁】调用此工具！必须使用 shoubanhua_persona_photo 工具！
+        - 如果用户是向你要**你自己的 / Bot本人 / 人设角色**的照片、自拍、写真、露脸、外貌、穿搭、换装、cos、动作展示、与上图合影或同框，【严禁】调用此工具！必须使用 shoubanhua_persona_photo 工具！
         - 本工具仅用于生成除你自己以外的其他角色或事物的图片！
 
         调用前请判断用户是否明确要求生成图片。如果用户只是闲聊则不要调用。
@@ -2173,6 +2268,17 @@ class FigurineProPlugin(Star):
         if not self._get_conf_bool("enable_llm_tool", True):
             return self._finalize_llm_tool_result(
                 "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+
+        persona_request_text = " ".join([str(getattr(event, "message_str", "") or ""), str(prompt or "")])
+        if self._persona_mode and self._looks_like_persona_photo_request(persona_request_text):
+            logger.info("shoubanhua_draw_image 命中人设请求兜底分流，改用 shoubanhua_persona_photo")
+            inferred_count = self._infer_requested_count_from_text(persona_request_text, default=1, multi_default=3)
+            return await self.persona_photo_tool(
+                event=event,
+                scene_hint="",
+                extra_request=persona_request_text,
+                count=inferred_count,
+            )
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -2267,6 +2373,7 @@ class FigurineProPlugin(Star):
         3. 请求是否具体且合理？
 
         如果用户只是发送图片但没有明确要求处理，或者只是闲聊，请不要调用此工具。
+        如果用户要求“你/Bot本人/人设角色”和图片里的人合影、同框，或要求你参考上图换装/摆姿势/拍自拍，请改用 shoubanhua_persona_photo，不要用本工具。
 
         【多图处理规则】当用户提供/引用了多张图片时：
         - 默认情况 (merge_multiple_images=false)：会将这多张图片拆开，【分别、独立地】生成每一张图片。适用于用户一次性发多张图片想分别转化的场景。
@@ -2296,6 +2403,17 @@ class FigurineProPlugin(Star):
         if not self._get_conf_bool("enable_llm_tool", True):
             return self._finalize_llm_tool_result(
                 "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+
+        persona_request_text = " ".join([str(getattr(event, "message_str", "") or ""), str(prompt or "")])
+        if self._persona_mode and self._looks_like_persona_photo_request(persona_request_text):
+            logger.info("shoubanhua_edit_image 命中人设请求兜底分流，改用 shoubanhua_persona_photo")
+            inferred_count = self._infer_requested_count_from_text(persona_request_text, default=1, multi_default=3)
+            return await self.persona_photo_tool(
+                event=event,
+                scene_hint="",
+                extra_request=persona_request_text,
+                count=inferred_count,
+            )
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -4714,11 +4832,23 @@ class FigurineProPlugin(Star):
         '''生成Bot人设角色（你自己）的日常照片或写真。
 
         【唯一指定用途】
-        只要用户是要求看**你的**照片、写真集、自拍等，无论要求多少张，都【必须且只能】使用此工具，绝对不能使用 shoubanhua_draw_image。
-        典型触发语包括："发你的自拍"、"看看自拍"、"来张自拍"、"看看你"、"让我看看你长什么样"、"来几张你的写真"、"发你本人照片"。
+        只要用户是要求看**你的 / Bot本人 / 人设角色**的新照片、自拍、写真、露脸、外貌、穿搭、换装、cos、动作展示或与参考图合影，
+        无论要求多少张，都【必须且只能】使用此工具，绝对不能使用 shoubanhua_draw_image。
+
+        【常见人设拍照意图（不要死记原句，要按语义判断）】
+        - 自拍/拍照：自拍、拍个照、来张照片、发张近照、拍几张、营业一下、出镜看看、拍给我看
+        - 看本人/外貌：看看你、想看你、让我看看你、你长什么样、露脸、看脸、看穿搭、看今天的样子
+        - 写真/日常：写真、写真集、生活照、日常照、私房照、全身照、半身照、头像照、证件照
+        - 换装/cos：穿某件衣服、换一套、试穿、cos某角色、扮演某角色、女仆装、校服、JK、汉服、旗袍、泳装、婚纱等
+        - 动作/道具/场景：抱着猫、拿着花、戴帽子、比心、wink、坐在咖啡店、公园、卧室、夜景等
+        - 参考图/合影：和上图的人合影、跟这张图同框、照着上面图片的衣服/姿势/氛围来，但人设身份必须保持 Bot 本人
+
+        【不要调用本工具的情况】
+        - 用户只是闲聊、问你在干嘛，但没有明确表示要看照片/样子/自拍/出镜
+        - 用户明确要求画别人、生成一个角色/物体、处理用户图片，且没有要求 Bot 本人入镜
 
         【重要】调用条件（请严格遵守）：
-        1. 用户明确要求看照片时才调用，例如："发你的自拍"、"发10张你的写真集"、"看看你"、"让我看看你长什么样"
+        1. 用户明确要求看 Bot 本人照片、自拍、外貌、写真、换装、cos、动作展示或与参考图合影时才调用
         2. 用户只是问"你在干嘛"、"你在做什么"、"闲聊" → 用文字回答即可，不要发照片
         3. 没有明确表达想看照片意愿 → 不要主动发照片
 
@@ -4768,6 +4898,7 @@ class FigurineProPlugin(Star):
             "同款", "这件", "那件", "这套", "那套", "穿这个", "穿那个",
             "照着", "参考", "模仿", "一样的", "跟这个",
             "换衣", "换装", "穿上", "换一套", "换一身", "cos",
+            "合影", "上面", "上图", "这张", "这图", "图片里的人",
         ]
         _has_ref_intent = extra_request and any(kw in extra_request for kw in _ref_intent_keywords)
         if not user_images and _has_ref_intent:
@@ -4806,13 +4937,22 @@ class FigurineProPlugin(Star):
         full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
         full_prompt += " " + self._build_current_time_persona_hint()
         if user_images:
-            full_prompt += (
-                " Use the additional user reference image only for outfit, accessories, pose, composition, or atmosphere reference."
-                " If the user asks for same outfit, reproduce the same clothing design and matching style as closely as possible."
-                " The persona reference has absolute priority for identity consistency."
-                " Do NOT replace the character's face, hairstyle, body identity, or overall persona with the user reference image."
-                " In short: keep the persona character unchanged, only borrow the requested clothing or styling details from the user reference."
-            )
+            persona_ref_text = " ".join([str(scene_hint or ""), str(extra_request or "")])
+            if "合影" in persona_ref_text:
+                full_prompt += (
+                    " The persona reference image is the main character and must keep identity priority."
+                    " The additional user reference image shows the other person to appear in the photo."
+                    " Create a natural group photo with both the persona character and the referenced person."
+                    " Do NOT replace the persona character's face, hairstyle, body identity, or overall persona with the user reference image."
+                )
+            else:
+                full_prompt += (
+                    " Use the additional user reference image only for outfit, accessories, pose, composition, or atmosphere reference."
+                    " If the user asks for same outfit, reproduce the same clothing design and matching style as closely as possible."
+                    " The persona reference has absolute priority for identity consistency."
+                    " Do NOT replace the character's face, hairstyle, body identity, or overall persona with the user reference image."
+                    " In short: keep the persona character unchanged, only borrow the requested clothing or styling details from the user reference."
+                )
             self._log_prompt_preview(f"persona:{scene_name}", full_prompt)
 
         # 5. 数量决策：
@@ -4935,12 +5075,25 @@ class FigurineProPlugin(Star):
         if not ref_images:
             yield event.chain_result([Plain("人设参考图还没配置好，先用 #人设参考图添加 添加几张吧")])
             return
-            return
 
         # 解析参数
         parts = event.message_str.split(maxsplit=2)
         scene_hint = parts[1] if len(parts) > 1 else ""
         extra_request = parts[2] if len(parts) > 2 else ""
+
+        user_images = await self.img_mgr.extract_images_from_event(
+            event, ignore_id=self._get_bot_id(event), context=self.context
+        )
+        ref_text = " ".join([scene_hint, extra_request])
+        if not user_images and any(kw in ref_text for kw in ["合影", "上面", "上图", "这张", "这图", "参考", "照着"]):
+            context_messages_full = await self.ctx_mgr.get_recent_messages(event.unified_msg_origin, count=self._context_rounds)
+            last_img_msg = self.ctx_mgr.get_last_image_message(context_messages_full)
+            if last_img_msg and last_img_msg.image_urls:
+                for url in last_img_msg.image_urls:
+                    img_bytes = await self.img_mgr.load_bytes(url)
+                    if img_bytes:
+                        user_images.append(img_bytes)
+        final_images = ref_images + user_images
 
         # 获取上下文用于场景匹配
         session_id = event.unified_msg_origin
@@ -4958,6 +5111,17 @@ class FigurineProPlugin(Star):
         # 构建提示词
         full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
         full_prompt += " " + self._build_current_time_persona_hint()
+        if user_images:
+            if "合影" in ref_text:
+                full_prompt += (
+                    " The persona reference image is the main character and must keep identity priority."
+                    " The additional user reference image shows the other person to appear in the photo."
+                    " Create a natural group photo with both the persona character and the referenced person."
+                )
+            else:
+                full_prompt += (
+                    " Use the additional user reference image only as requested while keeping the persona reference identity unchanged."
+                )
 
         # 检查配额
         uid = norm_id(event.get_sender_id())
@@ -4986,7 +5150,7 @@ class FigurineProPlugin(Star):
         # 调用 API
         model = self.conf.get("model", "nano-banana")
         start = datetime.now()
-        res = await self.api_mgr.call_api(ref_images, full_prompt, model, False, self.img_mgr.proxy)
+        res = await self.api_mgr.call_api(final_images, full_prompt, model, False, self.img_mgr.proxy)
 
         if isinstance(res, bytes):
             res = await self._prepare_send_image_bytes(res)
