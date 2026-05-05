@@ -532,6 +532,7 @@ class FigurineProPlugin(Star):
             "The character identity must strictly remain the same as the persona reference image.",
             "Preserve the original face, hairstyle, hair color, body shape, age appearance, and core character features from the persona reference.",
             "The output must still clearly be the same character from the persona reference, not a different girl with similar clothes.",
+            "Unless the user explicitly asks for a group photo or 合影, show only this one persona character and do not add extra people, standees, posters, cards, mirrors, or reference characters.",
             "Natural pose and expression, candid moment, high quality, detailed.",
             "Do NOT include any phones, cameras, or selfie elements in the image."
         ]
@@ -825,11 +826,14 @@ class FigurineProPlugin(Star):
             return False
 
         compact = re.sub(r"\s+", "", text)
+        persona_name = str(self.conf.get("persona_name", "") or "").strip().lower()
 
         bot_terms = [
             "你", "你的", "你自己", "你本人", "本人", "bot", "机器人", "助手",
             "小助手", "本体", "本尊", "看板娘"
         ]
+        if persona_name:
+            bot_terms.append(persona_name)
         selfie_terms = [
             "自拍", "自拍照", "自拍图", "自拍一张", "自拍几张", "自拍看看",
             "拍自己", "自己拍", "对镜拍", "镜子自拍", "前置摄像头"
@@ -837,7 +841,7 @@ class FigurineProPlugin(Star):
         photo_terms = [
             "照片", "相片", "照骗", "写真", "写真集", "私房照", "营业照",
             "生活照", "日常照", "近照", "全身照", "半身照", "头像照",
-            "证件照", "露脸照", "图", "图片"
+            "证件照", "露脸照"
         ]
         appearance_terms = [
             "露脸", "露脸看看", "脸", "脸蛋", "样子", "模样", "外貌", "长相",
@@ -888,7 +892,7 @@ class FigurineProPlugin(Star):
         is_sending_image_to_bot = any(term in compact for term in sending_to_bot_terms)
         explicit_bot_target = any(term in compact for term in [
             "你的", "你自己", "你本人", "bot", "机器人", "助手", "小助手", "本体", "本尊", "看板娘"
-        ])
+        ]) or bool(persona_name and persona_name in compact)
 
         if is_sending_image_to_bot and not explicit_bot_target:
             return False
@@ -930,7 +934,7 @@ class FigurineProPlugin(Star):
 
         # “cos/换装/抱着某物/摆姿势给我看”是展示 Bot 人设的新照片，而不是纯文生图。
         if (
-                has_style_show and has_request
+                has_style_show and has_request and (has_bot or has_bot_pattern or explicit_bot_target)
                 and not has_generation
                 and not (has_third_party_subject and not any(term in compact for term in ["cos", "cosplay", "扮演"]))
         ):
@@ -2869,6 +2873,67 @@ class FigurineProPlugin(Star):
         self._save_config()
 
         yield event.chain_result([Plain(f"✅ 已添加预设: {k}\n💾 已同步保存到配置文件")])
+
+    @filter.command("lm删除", aliases={"lmd", "lm删", "删除预设"}, prefix_optional=True)
+    async def on_delete_preset(self, event: AstrMessageEvent, ctx=None):
+        if not self.is_admin(event): return
+
+        raw = event.message_str.strip()
+        name = raw
+        for cmd in ["lm删除", "lmd", "lm删", "删除预设"]:
+            if name.startswith(cmd):
+                name = name[len(cmd):]
+                break
+        name = name.strip().lstrip(":：").strip()
+
+        if not name:
+            yield event.chain_result([Plain("用法: #lm删除 <预设名>\n例如: #lm删除 手办化新版")])
+            return
+
+        prompt_list = self.conf.get("prompt_list", [])
+        if not isinstance(prompt_list, list):
+            prompt_list = []
+
+        def _prompt_list_key(item) -> str:
+            text = str(item or "")
+            if ":" in text:
+                return text.split(":", 1)[0].strip()
+            if "：" in text:
+                return text.split("：", 1)[0].strip()
+            return ""
+
+        in_user_prompts = name in getattr(self.data_mgr, "user_prompts", {})
+        in_prompt_list = any(_prompt_list_key(item) == name for item in prompt_list)
+        exists = name in self.data_mgr.prompt_map
+
+        if exists and not in_user_prompts and not in_prompt_list:
+            yield event.chain_result([Plain(f"预设 [{name}] 是内置或配置文件固定预设，不能用 lm删除 删除。")])
+            return
+
+        if not exists and not in_user_prompts and not in_prompt_list:
+            yield event.chain_result([Plain(f"没找到预设 [{name}]")])
+            return
+
+        removed_runtime = await self.data_mgr.remove_user_prompt(name)
+        new_prompt_list = [item for item in prompt_list if _prompt_list_key(item) != name]
+        removed_config = len(new_prompt_list) != len(prompt_list)
+        self.conf["prompt_list"] = new_prompt_list
+
+        # 删除这个预设绑定的参考图，避免列表里没有预设但参考图索引还残留。
+        ref_count = await self.data_mgr.clear_preset_ref_images(name)
+
+        self.data_mgr.reload_prompts()
+        self._save_config()
+
+        details = []
+        if removed_runtime:
+            details.append("运行时记录")
+        if removed_config:
+            details.append("配置项")
+        if ref_count:
+            details.append(f"{ref_count} 张参考图")
+        detail_text = "\n已清理: " + "、".join(details) if details else ""
+        yield event.chain_result([Plain(f"✅ 已删除预设: {name}{detail_text}")])
 
     @filter.command("lm查看", aliases={"lmv", "lm预览"}, prefix_optional=True)
     async def on_view_preset(self, event: AstrMessageEvent, ctx=None):
@@ -4839,13 +4904,14 @@ class FigurineProPlugin(Star):
         - 自拍/拍照：自拍、拍个照、来张照片、发张近照、拍几张、营业一下、出镜看看、拍给我看
         - 看本人/外貌：看看你、想看你、让我看看你、你长什么样、露脸、看脸、看穿搭、看今天的样子
         - 写真/日常：写真、写真集、生活照、日常照、私房照、全身照、半身照、头像照、证件照
-        - 换装/cos：穿某件衣服、换一套、试穿、cos某角色、扮演某角色、女仆装、校服、JK、汉服、旗袍、泳装、婚纱等
+        - 换装/cos：要求你/Bot本人/人设角色穿某件衣服、换一套、试穿、cos某角色、扮演某角色等
         - 动作/道具/场景：抱着猫、拿着花、戴帽子、比心、wink、坐在咖啡店、公园、卧室、夜景等
         - 参考图/合影：和上图的人合影、跟这张图同框、照着上面图片的衣服/姿势/氛围来，但人设身份必须保持 Bot 本人
 
         【不要调用本工具的情况】
         - 用户只是闲聊、问你在干嘛，但没有明确表示要看照片/样子/自拍/出镜
         - 用户明确要求画别人、生成一个角色/物体、处理用户图片，且没有要求 Bot 本人入镜
+        - 用户只说“某角色cos某角色给我看”“画一个cos某角色的人”等第三方人物创作，应该使用 shoubanhua_draw_image
 
         【重要】调用条件（请严格遵守）：
         1. 用户明确要求看 Bot 本人照片、自拍、外貌、写真、换装、cos、动作展示或与参考图合影时才调用
@@ -4888,19 +4954,32 @@ class FigurineProPlugin(Star):
         logger.info(f"人设拍照：已加载人设参考图 {len(ref_images)} 张")
 
         # 1.5 提取用户可能提供的参考图片（如衣服款式、姿势参考等）
+        # 默认只取当前消息/已展开的引用图片，避免把上一轮生成图误当成“用户补充参考图”。
         user_images = []
         bot_id = self._get_bot_id(event)
-        user_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
-
-        # 如果当前消息没有图片，仅在用户明确表达了参考图意图时才回溯上下文
-        # 避免用户只说"看看自拍"时误取历史无关图片
+        requested_text = " ".join([str(scene_hint or ""), str(extra_request or "")]).strip()
         _ref_intent_keywords = [
-            "同款", "这件", "那件", "这套", "那套", "穿这个", "穿那个",
-            "照着", "参考", "模仿", "一样的", "跟这个",
-            "换衣", "换装", "穿上", "换一套", "换一身", "cos",
-            "合影", "上面", "上图", "这张", "这图", "图片里的人",
+            "同款", "这件", "那件", "这套", "那套", "这身", "那身",
+            "穿这个", "穿那个", "照着", "参考", "参考图", "模仿",
+            "一样的", "跟这个", "按这个", "合影", "同框", "一起拍",
+            "上面", "上图", "上一张", "刚才", "刚刚", "这张", "这图",
+            "这个图", "图片里的人", "照片里的人", "图里的人", "这个人", "那个人",
         ]
-        _has_ref_intent = extra_request and any(kw in extra_request for kw in _ref_intent_keywords)
+        _has_ref_intent = any(kw in requested_text for kw in _ref_intent_keywords)
+        user_images = await self.img_mgr.extract_images_from_event(
+            event, ignore_id=bot_id, context=None, include_at_avatar=False
+        )
+        user_ref_source = "current_or_expanded_reply" if user_images else ""
+
+        # 当前消息没有图片时，仅在用户明确说“上图/这张/参考/合影/同款”等引用意图时才回溯上下文。
+        # “cos 某角色给我看”不等于用户补充了参考图，否则会误捞上一轮生成图。
+        if not user_images and _has_ref_intent:
+            user_images = await self.img_mgr.extract_images_from_event(
+                event, ignore_id=bot_id, context=self.context, include_at_avatar=False
+            )
+            if user_images:
+                user_ref_source = "reply_fetch_by_explicit_reference"
+
         if not user_images and _has_ref_intent:
             session_id = event.unified_msg_origin
             context_messages_full = await self.ctx_mgr.get_recent_messages(session_id, count=self._context_rounds)
@@ -4911,11 +4990,13 @@ class FigurineProPlugin(Star):
                         img_bytes = await self.img_mgr.load_bytes(url)
                         if img_bytes:
                             user_images.append(img_bytes)
+                if user_images:
+                    user_ref_source = "recent_context_by_explicit_reference"
 
         # 合并图片：人设参考图在前，用户参考图在后
         final_images = ref_images + user_images
         if user_images:
-            logger.info(f"人设拍照：检测到用户补充参考图 {len(user_images)} 张")
+            logger.info(f"人设拍照：检测到用户补充参考图 {len(user_images)} 张，source={user_ref_source or 'unknown'}")
         logger.info(f"人设拍照：最终提交参考图总数 {len(final_images)} 张")
 
         # 2. 获取上下文用于场景匹配
@@ -4961,7 +5042,6 @@ class FigurineProPlugin(Star):
         # - 最后才根据“写真集/多来几张”等自然语言补推断。
         # 这样可以避免因为 extra_request 只保留了部分内容（如只剩“穿着睡衣”）而把
         # 已经由 LLM 明确决定好的批量参数错误降回 1 张。
-        requested_text = " ".join([str(scene_hint or ""), str(extra_request or "")]).strip()
         explicit_count = self._extract_explicit_requested_count_from_text(requested_text)
         incoming_count = max(1, int(count or 1))
 

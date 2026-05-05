@@ -117,6 +117,15 @@ class DataManager:
         await self._save_json(self.user_prompts_file, self.user_prompts)
         self.reload_prompts()
 
+    async def remove_user_prompt(self, key: str) -> bool:
+        """Remove a user-defined prompt preset and persist the change."""
+        if key not in self.user_prompts:
+            return False
+        del self.user_prompts[key]
+        await self._save_json(self.user_prompts_file, self.user_prompts)
+        self.reload_prompts()
+        return True
+
     # --- 积分相关 ---
     def get_user_count(self, uid: str) -> int:
         return self.user_counts.get(norm_id(uid), 0)
