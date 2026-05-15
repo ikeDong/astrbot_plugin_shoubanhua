@@ -27,6 +27,7 @@ class ImageManager:
         self.table_quality = config.get("preset_table_quality", "高清")
         self.table_columns = config.get("preset_table_columns", 5)
         self._font_download_lock = asyncio.Lock()
+        self._font_install_task: Optional[asyncio.Task] = None
 
     async def _download_image(self, url: str, timeout: Optional[int] = None) -> bytes | None:
         """通用下载逻辑"""
@@ -59,10 +60,51 @@ class ImageManager:
         except Exception:
             pass
 
-    async def ensure_default_font(self, data_dir: Path) -> str | None:
+    def _get_font_target_path(self, data_dir: Path) -> Path:
         font_dir = Path(data_dir) / "fonts"
         font_dir.mkdir(parents=True, exist_ok=True)
-        target_path = font_dir / self.DEFAULT_FONT_FILENAME
+        return font_dir / self.DEFAULT_FONT_FILENAME
+
+    def _on_font_install_task_done(self, task: asyncio.Task):
+        if task.cancelled():
+            logger.warning("Preset table font background install task was cancelled")
+        else:
+            try:
+                exc = task.exception()
+                if exc:
+                    logger.warning(f"Preset table font background install task failed: {exc}")
+            except Exception as e:
+                logger.warning(f"Preset table font background install task ended unexpectedly: {e}")
+
+        if self._font_install_task is task:
+            self._font_install_task = None
+
+    def schedule_default_font_install(self, data_dir: Path):
+        if self._font_install_task and not self._font_install_task.done():
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        self._font_install_task = loop.create_task(self.ensure_default_font(data_dir))
+        self._font_install_task.add_done_callback(self._on_font_install_task_done)
+
+    async def get_cached_font_path(self, data_dir: Path) -> str | None:
+        target_path = self._get_font_target_path(data_dir)
+
+        if target_path.exists() and await asyncio.to_thread(self._is_font_file_usable, target_path):
+            return str(target_path)
+
+        if target_path.exists():
+            logger.warning(f"Preset table font cache is invalid, removing: {target_path}")
+            await asyncio.to_thread(self._remove_file_if_exists, target_path)
+
+        return None
+
+    async def ensure_default_font(self, data_dir: Path) -> str | None:
+        target_path = self._get_font_target_path(data_dir)
 
         if target_path.exists() and await asyncio.to_thread(self._is_font_file_usable, target_path):
             return str(target_path)
@@ -696,7 +738,9 @@ class ImageManager:
     async def create_preset_table(self, presets: List[Tuple[str, bool]], data_mgr) -> bytes:
         """异步生成预览表格"""
         loop = asyncio.get_running_loop()
-        custom_font_path = await self.ensure_default_font(data_mgr.data_dir)
+        custom_font_path = await self.get_cached_font_path(data_mgr.data_dir)
+        if not custom_font_path:
+            self.schedule_default_font_install(data_mgr.data_dir)
 
         return await loop.run_in_executor(
             None,
