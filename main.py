@@ -598,6 +598,7 @@ class FigurineProPlugin(Star):
                 logger.error(f"FigurinePro: 恢复动态配置失败 {e}")
 
         await self.data_mgr.initialize()
+        await self.img_mgr.ensure_default_font(self.data_mgr.data_dir)
         if not self.conf.get("generic_api_keys") and not self.conf.get("gemini_api_keys"):
             logger.warning("FigurinePro: 未配置任何 API Key")
 

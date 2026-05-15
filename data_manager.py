@@ -10,7 +10,7 @@ from .utils import norm_id
 
 class DataManager:
     def __init__(self, data_dir: Path, config: Any):
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
         self.config = config
 
         self.user_counts_file = self.data_dir / "user_counts.json"
@@ -22,6 +22,7 @@ class DataManager:
         self.preset_ref_images_file = self.data_dir / "preset_ref_images.json"  # 预设参考图索引
         self.preset_images_dir = self.data_dir / "preset_images"
         self.preset_ref_images_dir = self.data_dir / "preset_ref_images"  # 预设参考图目录
+        self.fonts_dir = self.data_dir / "fonts"
 
         # [Fix] 确保数据目录存在
         if not self.data_dir.exists():
@@ -32,6 +33,9 @@ class DataManager:
         
         if not self.preset_ref_images_dir.exists():
             self.preset_ref_images_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.fonts_dir.exists():
+            self.fonts_dir.mkdir(parents=True, exist_ok=True)
 
         self.user_counts: Dict[str, int] = {}
         self.group_counts: Dict[str, int] = {}

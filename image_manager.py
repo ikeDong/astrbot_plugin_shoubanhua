@@ -5,7 +5,7 @@ import base64
 import ssl
 import re
 import inspect
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from pathlib import Path
 from PIL import Image as PILImage, ImageFont, ImageDraw
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
@@ -14,14 +14,27 @@ from astrbot import logger
 
 
 class ImageManager:
+    DEFAULT_FONT_FILENAME = "NotoSansCJKsc-Regular.otf"
+    DEFAULT_FONT_URLS = (
+        "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+        "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    )
+    SYSTEM_FONT_CANDIDATES = (
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    )
+
     def __init__(self, config: dict):
         self.proxy = config.get("proxy_url") if config.get("use_proxy") else None
         self.max_retries = config.get("download_retries", 3)
         self.timeout = config.get("timeout", 60)
         self.table_quality = config.get("preset_table_quality", "高清")
         self.table_columns = config.get("preset_table_columns", 5)
+        self._font_download_lock = asyncio.Lock()
 
-    async def _download_image(self, url: str) -> bytes | None:
+    async def _download_image(self, url: str, timeout: Optional[int] = None) -> bytes | None:
         """通用下载逻辑"""
         for i in range(self.max_retries + 1):
             try:
@@ -30,12 +43,73 @@ class ImageManager:
                 ssl_ctx.verify_mode = ssl.CERT_NONE
 
                 async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx)) as session:
-                    async with session.get(url, proxy=self.proxy, timeout=self.timeout) as resp:
+                    async with session.get(url, proxy=self.proxy, timeout=timeout or self.timeout) as resp:
                         resp.raise_for_status()
                         return await resp.read()
             except Exception as e:
                 if i < self.max_retries:
                     await asyncio.sleep(1)
+        return None
+
+    def _is_font_file_usable(self, font_path: Path) -> bool:
+        try:
+            ImageFont.truetype(str(font_path), 16)
+            return True
+        except Exception:
+            return False
+
+    def _get_system_font_path(self) -> str | None:
+        for font_path in self.SYSTEM_FONT_CANDIDATES:
+            if not Path(font_path).exists():
+                continue
+            if self._is_font_file_usable(Path(font_path)):
+                return font_path
+        return None
+
+    async def ensure_default_font(self, data_dir: Path) -> str | None:
+        font_dir = Path(data_dir) / "fonts"
+        font_dir.mkdir(parents=True, exist_ok=True)
+        target_path = font_dir / self.DEFAULT_FONT_FILENAME
+
+        if target_path.exists() and await asyncio.to_thread(self._is_font_file_usable, target_path):
+            return str(target_path)
+
+        async with self._font_download_lock:
+            if target_path.exists() and await asyncio.to_thread(self._is_font_file_usable, target_path):
+                return str(target_path)
+
+            tmp_path = target_path.with_name(f"{target_path.stem}.download{target_path.suffix}")
+            download_timeout = max(int(self.timeout), 180)
+
+            for url in self.DEFAULT_FONT_URLS:
+                try:
+                    logger.info(f"Preset table font missing, downloading from: {url}")
+                    font_bytes = await self._download_image(url, timeout=download_timeout)
+                    if not font_bytes or len(font_bytes) < 1024 * 1024:
+                        continue
+
+                    await asyncio.to_thread(tmp_path.write_bytes, font_bytes)
+                    if not await asyncio.to_thread(self._is_font_file_usable, tmp_path):
+                        continue
+
+                    await asyncio.to_thread(tmp_path.replace, target_path)
+                    logger.info(f"Preset table font ready: {target_path}")
+                    return str(target_path)
+                except Exception as e:
+                    logger.warning(f"Download preset table font failed from {url}: {e}")
+                finally:
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except Exception:
+                            pass
+
+        system_font = self._get_system_font_path()
+        if system_font:
+            logger.warning(f"Preset table font download failed, fallback to system font: {system_font}")
+            return system_font
+
+        logger.warning("Preset table font download failed, fallback to Pillow default font")
         return None
 
     def _optimize_output_image_sync(self, raw: bytes) -> bytes:
@@ -584,9 +658,7 @@ class ImageManager:
 
         if not font:
             # 回退系统字体
-            sys_fonts = ["C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/msyh.ttc",
-                         "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"]
-            for p in sys_fonts:
+            for p in self.SYSTEM_FONT_CANDIDATES:
                 if Path(p).exists():
                     try:
                         font = ImageFont.truetype(p, fs)
@@ -636,8 +708,7 @@ class ImageManager:
     async def create_preset_table(self, presets: List[Tuple[str, bool]], data_mgr) -> bytes:
         """异步生成预览表格"""
         loop = asyncio.get_running_loop()
-        current_dir = Path(__file__).parent
-        custom_font_path = str(current_dir / "fonts" / "text.ttf")
+        custom_font_path = await self.ensure_default_font(data_mgr.data_dir)
 
         return await loop.run_in_executor(
             None,
