@@ -132,6 +132,29 @@ class FigurineProPlugin(Star):
         "gemini_api_keys",
     ]
     _DYNAMIC_CONFIG_META_KEY = "__dynamic_overrides__"
+    _DYNAMIC_CONFIG_VERSION_KEY = "__dynamic_config_version__"
+    _DYNAMIC_CONFIG_UPDATED_AT_KEY = "__dynamic_updated_at__"
+    _DYNAMIC_CONFIG_VERSION = 2
+    _LEGACY_DYNAMIC_RESTORE_KEYS = {
+        "model",
+        "text_to_image_model",
+        "api_mode",
+        "prompt_list",
+        "generic_api_keys",
+        "gemini_api_keys",
+        "text_to_image_api_keys",
+    }
+    _COMMAND_PRIORITY_DYNAMIC_KEYS = {
+        "model",
+        "text_to_image_model",
+        "api_mode",
+        "prompt_list",
+    }
+    _PANEL_PRIORITY_DYNAMIC_KEYS = {
+        "generic_api_url",
+        "gemini_api_url",
+        "text_to_image_api_url",
+    }
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -184,6 +207,14 @@ class FigurineProPlugin(Star):
         self._session_generated_images_lock = asyncio.Lock()
         self._session_generated_images_max = max(1, int(config.get("pdf_session_image_cache", 20)))
 
+        # 会话级最近图片上下文：同时记录用户发送的图片和 Bot 生成的图片，供“修改上面那张”这类追问使用
+        self._session_recent_image_context: Dict[str, List[Dict[str, Any]]] = {}
+        self._session_recent_image_context_lock = asyncio.Lock()
+        self._session_recent_image_context_max = max(
+            1,
+            int(config.get("context_image_cache", self._session_generated_images_max) or self._session_generated_images_max)
+        )
+
         # PDF 暂存模式：当 pack_images_to_pdf 被调用时，通知后台生成任务不要发送单张图片，
         # 而是将图片写入暂存文件夹，等全部生成完后统一打包 PDF 发送。
         self._pdf_staging_sessions: Dict[str, bool] = {}  # session_id -> True 表示处于暂存模式
@@ -215,6 +246,177 @@ class FigurineProPlugin(Star):
                     pass
 
         return removed
+
+    def _get_schema_defaults(self) -> Dict[str, Any]:
+        """读取配置 schema 默认值，用于判断 dynamic_config 是否会覆盖用户面板保存的新配置。"""
+        try:
+            import os
+            schema_path = os.path.join(os.path.dirname(__file__), "_conf_schema.json")
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema = json.load(f)
+
+            if not isinstance(schema, dict):
+                return {}
+
+            defaults = {}
+            for key, item in schema.items():
+                if isinstance(item, dict) and "default" in item:
+                    defaults[key] = item.get("default")
+            return defaults
+        except Exception as e:
+            logger.warning(f"FigurinePro: 读取配置默认值失败，将使用保守恢复策略: {e}")
+            return {}
+
+    @staticmethod
+    def _is_empty_config_value(value) -> bool:
+        return value is None or value == "" or value == [] or value == {}
+
+    def _should_restore_dynamic_value(
+            self,
+            key: str,
+            dynamic_value,
+            has_override_meta: bool,
+            schema_defaults: Dict[str, Any],
+            dynamic_backup_is_newer: Optional[bool] = None,
+    ) -> Tuple[bool, str]:
+        """决定是否用 dynamic_config 覆盖当前配置。
+
+        原则：
+        1. 新版带元数据的命令改动仍然可以在重启后恢复；
+        2. 如果 AstrBot 当前配置已经是非默认值，说明面板保存过，优先保留面板值；
+        3. 旧版无元数据备份只恢复命令可能改动过的字段，避免老地址反复盖回去。
+        """
+        if key not in self._DYNAMIC_CONFIG_KEYS:
+            return False, "unknown-key"
+
+        current_exists = key in self.conf
+        current_value = self.conf.get(key) if current_exists else None
+        if current_exists and current_value == dynamic_value:
+            return False, "same-value"
+
+        has_default = key in schema_defaults
+        default_value = schema_defaults.get(key)
+        current_is_default = has_default and current_value == default_value
+
+        if has_override_meta:
+            if current_exists and not current_is_default:
+                if key in self._PANEL_PRIORITY_DYNAMIC_KEYS:
+                    return False, "keep-panel-value"
+                if dynamic_backup_is_newer is True:
+                    return True, "metadata-newer"
+                if dynamic_backup_is_newer is None and key in self._COMMAND_PRIORITY_DYNAMIC_KEYS:
+                    return True, "metadata-command-priority"
+                return False, "keep-panel-value"
+            return True, "metadata-override"
+
+        if key not in self._LEGACY_DYNAMIC_RESTORE_KEYS:
+            return False, "legacy-url-or-unsupported"
+
+        if self._is_empty_config_value(dynamic_value):
+            return False, "legacy-empty"
+
+        if has_default and dynamic_value == default_value:
+            return False, "legacy-default"
+
+        if current_exists and not current_is_default:
+            return False, "keep-panel-value"
+
+        return True, "legacy-compatible"
+
+    def _build_dynamic_config_backup(self, override_keys) -> Dict[str, Any]:
+        dynamic_keys = list(self._DYNAMIC_CONFIG_KEYS)
+        clean_overrides = sorted({k for k in override_keys if k in dynamic_keys})
+
+        save_data = {}
+        for k in dynamic_keys:
+            if k in self.conf:
+                save_data[k] = self.conf[k]
+
+        save_data[self._DYNAMIC_CONFIG_META_KEY] = clean_overrides
+        save_data[self._DYNAMIC_CONFIG_VERSION_KEY] = self._DYNAMIC_CONFIG_VERSION
+        save_data[self._DYNAMIC_CONFIG_UPDATED_AT_KEY] = datetime.now().isoformat(timespec="seconds")
+        return save_data
+
+    def _write_dynamic_config_backup(self, config_path: str, override_keys) -> None:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(self._build_dynamic_config_backup(override_keys), f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _coerce_existing_file_path(value) -> Optional[str]:
+        try:
+            import os
+            if not value:
+                return None
+
+            path = os.fspath(value)
+            if os.path.isfile(path):
+                return path
+        except Exception:
+            return None
+        return None
+
+    def _get_config_source_mtime(self) -> Optional[float]:
+        """尽量定位 AstrBot 原始配置文件，用 mtime 判断面板保存和命令备份谁更新。"""
+        import os
+
+        candidates = []
+        attr_names = (
+            "path",
+            "file_path",
+            "filepath",
+            "config_path",
+            "_path",
+            "_file_path",
+            "_filepath",
+            "_config_path",
+        )
+        key_names = (
+            "__config_path__",
+            "_config_path",
+            "config_path",
+            "path",
+        )
+
+        for attr in attr_names:
+            candidates.append(getattr(self.conf, attr, None))
+
+        for key in key_names:
+            try:
+                candidates.append(self.conf.get(key))
+            except Exception:
+                pass
+
+        try:
+            for value in vars(self.conf).values():
+                if isinstance(value, (str, os.PathLike)):
+                    candidates.append(value)
+        except Exception:
+            pass
+
+        mtimes = []
+        for candidate in candidates:
+            path = self._coerce_existing_file_path(candidate)
+            if path:
+                try:
+                    mtimes.append(os.path.getmtime(path))
+                except Exception:
+                    pass
+
+        return max(mtimes) if mtimes else None
+
+    def _is_dynamic_backup_newer_than_config(self, config_path: str) -> Optional[bool]:
+        import os
+
+        config_mtime = self._get_config_source_mtime()
+        if config_mtime is None:
+            return None
+
+        try:
+            dynamic_mtime = os.path.getmtime(config_path)
+        except Exception:
+            return None
+
+        return dynamic_mtime >= config_mtime
 
     def _is_message_processed(self, msg_id: str) -> bool:
         """
@@ -570,8 +772,8 @@ class FigurineProPlugin(Star):
         if removed_from_runtime > 0:
             logger.info(f"FigurinePro: 已从运行时配置中清理 {removed_from_runtime} 个废弃强力模式字段")
 
-        # 尝试加载动态配置备份。通过命令改动过的字段需要覆盖 schema 默认值，
-        # 否则重启后会被默认配置重新盖回去。
+        # 尝试加载动态配置备份。命令改动过的字段需要覆盖 schema 默认值，
+        # 但面板里已经保存的新配置要优先，避免地址/Key 被旧备份盖回去。
         import os
         import json
         config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
@@ -583,10 +785,10 @@ class FigurineProPlugin(Star):
                 if not isinstance(dynamic_conf, dict):
                     dynamic_conf = {}
 
+                dynamic_backup_changed = False
                 removed_from_backup = self._purge_deprecated_config_keys(dynamic_conf)
                 if removed_from_backup > 0:
-                    with open(config_path, "w", encoding="utf-8") as fw:
-                        json.dump(dynamic_conf, fw, ensure_ascii=False, indent=2)
+                    dynamic_backup_changed = True
                     logger.info(
                         f"FigurinePro: 已从 dynamic_config.json 清理 {removed_from_backup} 个废弃强力模式字段")
 
@@ -597,22 +799,56 @@ class FigurineProPlugin(Star):
                 has_override_meta = isinstance(override_keys, list)
                 if has_override_meta:
                     keys_to_restore = [k for k in override_keys if k in dynamic_keys]
+                    active_override_keys = set(keys_to_restore)
                 else:
-                    # 兼容旧版 dynamic_config.json：没有元数据时，按所有已知动态字段恢复。
+                    # 兼容旧版 dynamic_config.json：没有元数据时，只恢复命令可能改动过的字段。
                     keys_to_restore = [k for k in dynamic_conf.keys() if k in dynamic_keys]
+                    active_override_keys = set()
+                    dynamic_backup_changed = True
 
+                schema_defaults = self._get_schema_defaults()
+                dynamic_backup_is_newer = self._is_dynamic_backup_newer_than_config(config_path)
+                restored_keys = []
+                skip_reasons: Dict[str, int] = {}
                 for k in keys_to_restore:
-                    v = dynamic_conf.get(k)
-                    if v is None or (not has_override_meta and (v == "" or v == [] or v == {})):
+                    if k not in dynamic_conf:
                         skipped_count += 1
+                        active_override_keys.discard(k)
+                        skip_reasons["missing-value"] = skip_reasons.get("missing-value", 0) + 1
                         continue
 
-                    self.conf[k] = v
-                    restored_count += 1
+                    v = dynamic_conf.get(k)
+                    should_restore, reason = self._should_restore_dynamic_value(
+                        k, v, has_override_meta, schema_defaults, dynamic_backup_is_newer
+                    )
+
+                    if should_restore:
+                        self.conf[k] = v
+                        restored_count += 1
+                        restored_keys.append(k)
+                        active_override_keys.add(k)
+                    else:
+                        skipped_count += 1
+                        skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                        if reason == "keep-panel-value":
+                            active_override_keys.discard(k)
+                            dynamic_backup_changed = True
+
+                if not has_override_meta:
+                    active_override_keys = set(restored_keys)
 
                 logger.info(
                     f"FigurinePro: dynamic_config.json 恢复完成，恢复 {restored_count} 项，跳过 {skipped_count} 项"
                 )
+                if skip_reasons:
+                    logger.info(f"FigurinePro: dynamic_config.json 跳过原因统计: {skip_reasons}")
+
+                normalized_overrides = sorted(active_override_keys)
+                if dynamic_backup_changed or (
+                        has_override_meta and normalized_overrides != sorted(keys_to_restore)
+                ):
+                    self._write_dynamic_config_backup(config_path, normalized_overrides)
+                    logger.info("FigurinePro: 已规范化 dynamic_config.json，后续不会反复覆盖面板配置")
             except Exception as e:
                 logger.error(f"FigurinePro: 恢复动态配置失败 {e}")
 
@@ -690,13 +926,14 @@ class FigurineProPlugin(Star):
                     with open(config_path, "r", encoding="utf-8") as rf:
                         previous_data = json.load(rf)
                     if isinstance(previous_data, dict):
-                        previous_raw = previous_data.get(self._DYNAMIC_CONFIG_META_KEY, [])
+                        previous_raw = previous_data.get(self._DYNAMIC_CONFIG_META_KEY)
                         if isinstance(previous_raw, list):
                             previous_overrides = {k for k in previous_raw if k in dynamic_keys}
-                        else:
+                        elif previous_raw is not None:
                             previous_overrides = {
                                 k for k in previous_data.keys()
-                                if k in dynamic_keys and previous_data.get(k) not in (None, "", [], {})
+                                if k in self._LEGACY_DYNAMIC_RESTORE_KEYS
+                                and previous_data.get(k) not in (None, "", [], {})
                             }
                 except Exception:
                     previous_overrides = set()
@@ -707,14 +944,7 @@ class FigurineProPlugin(Star):
             else:
                 override_keys = sorted(previous_overrides or dynamic_keys)
 
-            save_data = {}
-            for k in dynamic_keys:
-                if k in self.conf:
-                    save_data[k] = self.conf[k]
-            save_data[self._DYNAMIC_CONFIG_META_KEY] = override_keys
-
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(save_data, f, ensure_ascii=False, indent=2)
+            self._write_dynamic_config_backup(config_path, override_keys)
 
             if not saved:
                 logger.info("FigurinePro: 无法通过原生方法保存，已使用本地 dynamic_config.json 进行了持久化")
@@ -1162,6 +1392,12 @@ class FigurineProPlugin(Star):
 
             self._session_generated_images[session_id] = current
 
+        await self._remember_session_image_context(
+            session_id,
+            image_bytes_list=[image_bytes],
+            source="bot_generated"
+        )
+
     async def _get_recent_generated_images(self, session_id: str, max_images: int = 0) -> List[bytes]:
         """获取会话中最近成功生成的图片缓存"""
         if not session_id:
@@ -1189,6 +1425,269 @@ class FigurineProPlugin(Star):
             sources.append(f"base64://{base64.b64encode(image_bytes).decode()}")
 
         return sources
+
+    async def _remember_session_image_context(
+            self,
+            session_id: str,
+            image_bytes_list: Optional[List[bytes]] = None,
+            image_urls: Optional[List[str]] = None,
+            source: str = "user",
+    ):
+        """记录会话内最近出现过的图片，支持后续“改上面那张/继续改”无需显式引用。"""
+        if not session_id:
+            return
+
+        now = datetime.now().timestamp()
+        new_entries: List[Dict[str, Any]] = []
+
+        for img in image_bytes_list or []:
+            if isinstance(img, bytes) and img:
+                new_entries.append({
+                    "source": source,
+                    "bytes": img,
+                    "urls": [],
+                    "timestamp": now,
+                })
+
+        for url in image_urls or []:
+            if self.img_mgr._is_probably_valid_source(url):
+                new_entries.append({
+                    "source": source,
+                    "bytes": None,
+                    "urls": [url],
+                    "timestamp": now,
+                })
+
+        if not new_entries:
+            return
+
+        async with self._session_recent_image_context_lock:
+            current = list(self._session_recent_image_context.get(session_id, []))
+
+            for entry in new_entries:
+                entry_bytes = entry.get("bytes")
+                entry_urls = entry.get("urls") or []
+
+                duplicated = False
+                for old in current:
+                    old_bytes = old.get("bytes")
+                    old_urls = old.get("urls") or []
+                    if entry_bytes and isinstance(old_bytes, bytes) and old_bytes == entry_bytes:
+                        duplicated = True
+                        break
+                    if entry_urls and any(url in old_urls for url in entry_urls):
+                        duplicated = True
+                        break
+
+                if not duplicated:
+                    current.append(entry)
+
+            if len(current) > self._session_recent_image_context_max:
+                current = current[-self._session_recent_image_context_max:]
+
+            self._session_recent_image_context[session_id] = current
+
+    async def _get_recent_session_image_context(
+            self,
+            session_id: str,
+            max_images: int = 1,
+            include_user: bool = True,
+            include_bot: bool = True,
+    ) -> List[bytes]:
+        """按时间顺序返回最近图片上下文的 bytes，优先使用已缓存 bytes，回退到 URL 加载。"""
+        if not session_id:
+            return []
+
+        async with self._session_recent_image_context_lock:
+            entries = list(self._session_recent_image_context.get(session_id, []))
+
+        filtered: List[Dict[str, Any]] = []
+        for entry in entries:
+            source = str(entry.get("source") or "")
+            is_bot_source = source.startswith("bot")
+            if is_bot_source and not include_bot:
+                continue
+            if (not is_bot_source) and not include_user:
+                continue
+            filtered.append(entry)
+
+        if max_images and max_images > 0:
+            filtered = filtered[-max_images:]
+
+        results: List[bytes] = []
+        seen_hashes = set()
+
+        for entry in filtered:
+            img_bytes = entry.get("bytes")
+            if isinstance(img_bytes, bytes) and img_bytes:
+                h = hash(img_bytes)
+                if h not in seen_hashes:
+                    results.append(img_bytes)
+                    seen_hashes.add(h)
+                continue
+
+            for url in entry.get("urls") or []:
+                loaded = await self.img_mgr.load_bytes(url)
+                if not loaded:
+                    continue
+                h = hash(loaded)
+                if h in seen_hashes:
+                    continue
+                results.append(loaded)
+                seen_hashes.add(h)
+
+        return results
+
+    async def _has_recent_session_image_context(self, session_id: str) -> bool:
+        if not session_id:
+            return False
+        async with self._session_recent_image_context_lock:
+            return bool(self._session_recent_image_context.get(session_id))
+
+    async def _get_recent_session_image_context_count(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        async with self._session_recent_image_context_lock:
+            return len(self._session_recent_image_context.get(session_id, []))
+
+    async def _clear_session_recent_image_context(self, session_id: str):
+        if not session_id:
+            return
+        async with self._session_recent_image_context_lock:
+            self._session_recent_image_context.pop(session_id, None)
+
+    def _looks_like_context_image_reference(self, text: str) -> bool:
+        """识别“把刚才那张/上面那张/继续改”这类依赖图片上下文的请求。"""
+        compact = re.sub(r"\s+", "", str(text or "").lower())
+        if not compact:
+            return False
+
+        reference_terms = [
+            "上面", "上图", "上一张", "上一幅", "上一版", "前面", "刚才", "刚刚",
+            "刚生成", "刚做", "刚发", "刚改", "刚修", "这张", "这图", "这幅",
+            "这个图", "那张", "那图", "原图", "它", "这个", "继续",
+        ]
+        edit_terms = [
+            "改", "修改", "编辑", "修", "调整", "处理", "换", "变成", "做成",
+            "转成", "加", "加上", "去掉", "删除", "移除", "重画", "重做",
+            "手办化", "q版", "痛屋", "痛车", "cos", "扩图", "补图",
+        ]
+
+        has_reference = any(term in compact for term in reference_terms)
+        has_edit = any(term in compact for term in edit_terms)
+        if has_reference and has_edit:
+            return True
+
+        explicit_followups = [
+            "继续改", "再改", "接着改", "继续修", "再修", "按上面", "照上面",
+            "基于上面", "在此基础上", "在这个基础上", "用刚才那张",
+        ]
+        return any(term in compact for term in explicit_followups)
+
+    def _infer_context_image_source_preference(self, text: str) -> str:
+        """根据用户措辞猜测要回溯用户原图还是 Bot 生成图。返回 user/bot/空字符串。"""
+        compact = re.sub(r"\s+", "", str(text or "").lower())
+        if not compact:
+            return ""
+
+        bot_terms = [
+            "你生成", "你刚生成", "刚生成", "刚做", "刚画", "刚改", "刚修",
+            "你发的", "上一版", "上个版本", "上面修改", "刚才修改", "继续改",
+        ]
+        if any(term in compact for term in bot_terms):
+            return "bot"
+
+        user_terms = [
+            "我发", "我刚发", "我传", "我上传", "我给你的", "我给你发",
+            "用户图", "原图", "原来的图", "原照片", "原始图片", "第一张",
+        ]
+        if any(term in compact for term in user_terms):
+            return "user"
+
+        return ""
+
+    async def _resolve_contextual_image_inputs(
+            self,
+            event: AstrMessageEvent,
+            prompt: str = "",
+            merge_multiple_images: bool = False,
+            include_current: bool = True,
+            allow_context_fallback: bool = True,
+    ) -> List[bytes]:
+        """统一解析当前消息、引用消息、用户历史图片和 Bot 最近生成图。"""
+        images: List[bytes] = []
+        bot_id = self._get_bot_id(event)
+
+        if include_current:
+            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+            if images:
+                await self._remember_session_image_context(
+                    event.unified_msg_origin,
+                    image_bytes_list=images,
+                    source="user_current"
+                )
+                return images
+
+        request_text = " ".join([
+            str(getattr(event, "message_str", "") or ""),
+            str(prompt or "")
+        ])
+        if not allow_context_fallback and not self._looks_like_context_image_reference(request_text):
+            return images
+
+        session_id = event.unified_msg_origin
+        max_images = 3 if merge_multiple_images else 1
+        source_preference = self._infer_context_image_source_preference(request_text)
+
+        context_images = await self._get_recent_session_image_context(
+            session_id,
+            max_images=max_images,
+            include_user=source_preference != "bot",
+            include_bot=source_preference != "user",
+        )
+        if not context_images and source_preference:
+            context_images = await self._get_recent_session_image_context(
+                session_id,
+                max_images=max_images,
+                include_user=True,
+                include_bot=True,
+            )
+        if context_images:
+            logger.info(f"FigurinePro: 使用最近图片上下文 {len(context_images)} 张作为本次图生图输入")
+            return context_images
+
+        # 兼容旧缓存：如果最近图片上下文还没有内容，回退到生成缓存。
+        recent_generated = await self._get_recent_generated_images(session_id, max_images=max_images)
+        if recent_generated:
+            logger.info(f"FigurinePro: 使用最近生成缓存 {len(recent_generated)} 张作为本次图生图输入")
+            return recent_generated
+
+        # 最后从文本上下文记录中的图片 URL 回退，包含 Bot 消息。
+        image_sources = await self._collect_images_from_context(
+            session_id, count=self._context_rounds, include_bot=True
+        )
+        all_urls = []
+        for _, urls in image_sources:
+            for url in urls:
+                if url not in all_urls:
+                    all_urls.append(url)
+
+        urls_to_fetch = all_urls[-max_images:] if all_urls else []
+        for url in urls_to_fetch:
+            img_bytes = await self.img_mgr.load_bytes(url)
+            if img_bytes:
+                images.append(img_bytes)
+
+        if images:
+            await self._remember_session_image_context(
+                session_id,
+                image_bytes_list=images,
+                image_urls=urls_to_fetch,
+                source="context_history"
+            )
+            logger.info(f"FigurinePro: 从上下文图片记录恢复 {len(images)} 张作为本次图生图输入")
+
+        return images
 
     async def _clear_session_image_cache(self, session_id: str):
         """清除会话的图片缓存和成功计数，用于 PDF 打包成功后防止旧图残留"""
@@ -2288,6 +2787,7 @@ class FigurineProPlugin(Star):
 
         【排他性条件（极度重要！）】
         - 如果用户是向你要**你自己的 / Bot本人 / 人设角色**的照片、自拍、写真、露脸、外貌、穿搭、换装、cos、动作展示、与上图合影或同框，【严禁】调用此工具！必须使用 shoubanhua_persona_photo 工具！
+        - 如果用户说“修改上面那张 / 改刚才那张 / 继续改 / 在这个基础上改”等依赖上一张图片的请求，【严禁】调用此工具！必须使用 shoubanhua_edit_image，用户不需要重新引用图片。
         - 本工具仅用于生成除你自己以外的其他角色或事物的图片！
 
         调用前请判断用户是否明确要求生成图片。如果用户只是闲聊则不要调用。
@@ -2427,6 +2927,7 @@ class FigurineProPlugin(Star):
 
         如果用户只是发送图片但没有明确要求处理，或者只是闲聊，请不要调用此工具。
         如果用户要求“你/Bot本人/人设角色”和图片里的人合影、同框，或要求你参考上图换装/摆姿势/拍自拍，请改用 shoubanhua_persona_photo，不要用本工具。
+        如果用户明确要求“修改上面那张 / 改刚才生成的图 / 继续改 / 在这个基础上改”，即使当前消息没有图片也要调用本工具；系统会自动使用最近的用户图片或Bot生成图片作为输入，不需要让用户引用。
 
         【多图处理规则】当用户提供/引用了多张图片时：
         - 默认情况 (merge_multiple_images=false)：会将这多张图片拆开，【分别、独立地】生成每一张图片。适用于用户一次性发多张图片想分别转化的场景。
@@ -2500,50 +3001,14 @@ class FigurineProPlugin(Star):
         show_llm_progress = self._get_conf_bool("llm_show_progress", True)
         hide_llm_result_text = True
 
-        # 3. 提取图片
-        images = []
-        if use_message_images:
-            bot_id = self._get_bot_id(event)
-            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
-
-        # 检查上下文图片（优先最近生成缓存，再回退到上下文，且允许取到 Bot 刚发送的图）
-        if not images:
-            session_id = event.unified_msg_origin
-
-            # 1. 优先使用当前会话最近成功生成的图片缓存，避免“刚发的图”还没稳定进入上下文时丢失
-            cached_limit = 3 if merge_multiple_images else 1
-            recent_generated = await self._get_recent_generated_images(session_id, max_images=cached_limit)
-            if recent_generated:
-                if merge_multiple_images:
-                    images.extend(recent_generated[-3:])
-                else:
-                    images.append(recent_generated[-1])
-
-        if not images:
-            # 2. 再从上下文中回退，并允许包含 Bot 发出的最近图片
-            session_id = event.unified_msg_origin
-            image_sources = await self._collect_images_from_context(
-                session_id, count=self._context_rounds, include_bot=True
-            )
-
-            all_urls = []
-            for _, urls in image_sources:
-                for url in urls:
-                    if url not in all_urls:
-                        all_urls.append(url)
-
-            urls_to_fetch = []
-            if all_urls:
-                if merge_multiple_images:
-                    urls_to_fetch = all_urls[-3:]  # 最多合并3张
-                else:
-                    urls_to_fetch = [all_urls[-1]]  # 默认取最近1张
-
-            if urls_to_fetch:
-                for url in urls_to_fetch:
-                    img_bytes = await self.img_mgr.load_bytes(url)
-                    if img_bytes:
-                        images.append(img_bytes)
+        # 3. 提取图片。当前消息没有图时，自动回溯用户/机器人最近图片上下文。
+        images = await self._resolve_contextual_image_inputs(
+            event,
+            prompt=prompt,
+            merge_multiple_images=merge_multiple_images,
+            include_current=use_message_images,
+            allow_context_fallback=True,
+        )
 
         if not images:
             # 不要重复发送错误消息，只返回给 LLM
@@ -2777,11 +3242,38 @@ class FigurineProPlugin(Star):
         bot_id = self._get_bot_id(event)
         # 传递 bot_id 给 image manager 以过滤，并传入 context 支持 message_id
         images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+        if images:
+            await self._remember_session_image_context(
+                event.unified_msg_origin,
+                image_bytes_list=images,
+                source="user_current"
+            )
 
         if not is_bnn and user_prompt:
             urls = extract_image_urls_from_text(user_prompt)
             for u in urls:
-                if b := await self.img_mgr.load_bytes(u): images.append(b)
+                if b := await self.img_mgr.load_bytes(u):
+                    images.append(b)
+                    await self._remember_session_image_context(
+                        event.unified_msg_origin,
+                        image_bytes_list=[b],
+                        image_urls=[u],
+                        source="user_prompt_url"
+                    )
+
+        wants_context_image = bool(user_prompt and self._looks_like_context_image_reference(user_prompt))
+        if not images and wants_context_image:
+            images = await self._resolve_contextual_image_inputs(
+                event,
+                prompt=user_prompt,
+                merge_multiple_images=False,
+                include_current=False,
+                allow_context_fallback=False,
+            )
+
+        if not images and wants_context_image:
+            yield event.chain_result([Plain("没找到可继续修改的上文图片，先发图或生成一张再说。")])
+            return
 
         if not images and not (is_bnn and user_prompt):
             yield event.chain_result([Plain("请发送图片或提供描述。")])
@@ -2818,8 +3310,11 @@ class FigurineProPlugin(Star):
         )
 
         if isinstance(res, bytes):
+            res = await self._prepare_send_image_bytes(res)
             elapsed = (datetime.now() - start).total_seconds()
             await self.data_mgr.record_usage(uid, gid)
+            await self._register_generation_success(event.unified_msg_origin, 1)
+            await self._register_generated_image(event.unified_msg_origin, res)
             if not is_bnn: await self.data_mgr.save_preset_image(base_cmd, res)
 
             quota_str = self._get_quota_str(deduction, uid, gid)
@@ -2879,6 +3374,8 @@ class FigurineProPlugin(Star):
             res = await self._prepare_send_image_bytes(res)
             elapsed = (datetime.now() - start).total_seconds()
             await self.data_mgr.record_usage(uid, norm_id(event.get_group_id()))
+            await self._register_generation_success(event.unified_msg_origin, 1)
+            await self._register_generated_image(event.unified_msg_origin, res)
             quota_str = self._get_quota_str(deduction, uid, norm_id(event.get_group_id()))
             timing_text = self._format_success_timing(elapsed)
             info = f"\n✅ 生成成功 ({timing_text}) | 预设: {preset_name}"
@@ -3305,6 +3802,13 @@ class FigurineProPlugin(Star):
                 image_urls=msg_info["image_urls"]
             )
 
+            if msg_info["image_urls"]:
+                await self._remember_session_image_context(
+                    session_id,
+                    image_urls=msg_info["image_urls"],
+                    source="bot_context" if is_bot else "user"
+                )
+
         except Exception as e:
             logger.debug(f"FigurinePro: 消息记录失败: {e}")
 
@@ -3322,6 +3826,7 @@ class FigurineProPlugin(Star):
         4. 如果用户是在索要你自己的照片、自拍、写真、长相，请不要用这个工具，必须改用 shoubanhua_persona_photo
 
         此工具会消耗用户的使用次数，请谨慎调用。
+        如果用户明确说“修改上面那张 / 改刚才那张 / 继续改 / 在这个基础上改”，即使当前消息没带图片，也应按 image_to_image 处理，系统会自动取最近图片上下文。
 
         Args:
             user_request(string): 用户的请求描述（可选，如果为空则使用当前消息）
@@ -3350,6 +3855,12 @@ class FigurineProPlugin(Star):
         msg_info = self._extract_message_info(event)
         current_message = user_request or msg_info["content"]
         has_current_image = msg_info["has_image"]
+        has_recent_image_context = await self._has_recent_session_image_context(session_id)
+        references_recent_image = (
+                (not has_current_image)
+                and has_recent_image_context
+                and self._looks_like_context_image_reference(current_message)
+        )
 
         # 2.5 对“看你本人照片/自拍/写真”做强制分流，避免 LLM 误走通用智能工具
         if self._persona_mode and (
@@ -3364,12 +3875,20 @@ class FigurineProPlugin(Star):
                 count=inferred_count,
             )
 
-        # 3. 分析任务类型
-        analysis = LLMTaskAnalyzer.analyze_task_type(
-            current_message=current_message,
-            context_messages=context_messages,
-            has_current_image=has_current_image
-        )
+        # 3. 分析任务类型。对“修改上面那张/继续改刚才那张”优先按图生图处理。
+        if references_recent_image:
+            analysis = {
+                "task_type": "image_to_image",
+                "confidence": 0.95,
+                "reason": "检测到用户明确引用最近图片上下文并要求修改",
+                "suggested_prompt": current_message,
+            }
+        else:
+            analysis = LLMTaskAnalyzer.analyze_task_type(
+                current_message=current_message,
+                context_messages=context_messages,
+                has_current_image=has_current_image
+            )
 
         task_type = analysis["task_type"]
         confidence = analysis["confidence"]
@@ -3428,24 +3947,14 @@ class FigurineProPlugin(Star):
                 )
                 await event.send(event.chain_result([Plain(feedback)]))
 
-            # 提取图片
-            bot_id = self._get_bot_id(event)
-            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
-
-            # 如果当前消息没有图片，优先尝试使用会话内最近成功生成的图片缓存
-            if not images:
-                recent_generated = await self._get_recent_generated_images(event.unified_msg_origin, max_images=3)
-                if recent_generated:
-                    images.extend(recent_generated[-3:])
-
-            # 如果仍然没有图片，再尝试从上下文获取最后一条带图消息（包含 Bot 刚发送的图）
-            if not images and context_messages:
-                last_img_msg = self.ctx_mgr.get_last_image_message(context_messages)
-                if last_img_msg and last_img_msg.image_urls:
-                    for url in last_img_msg.image_urls:
-                        img_bytes = await self.img_mgr.load_bytes(url)
-                        if img_bytes:
-                            images.append(img_bytes)
+            # 提取图片；当前消息没图时，会自动使用最近用户图片或 Bot 生成图。
+            images = await self._resolve_contextual_image_inputs(
+                event,
+                prompt=prompt,
+                merge_multiple_images=False,
+                include_current=True,
+                allow_context_fallback=True,
+            )
 
             if not images:
                 return self._finalize_llm_tool_result(
@@ -3479,6 +3988,7 @@ class FigurineProPlugin(Star):
 
         session_id = event.unified_msg_origin
         messages = await self.ctx_mgr.get_recent_messages(session_id, count=10)
+        image_context_count = await self._get_recent_session_image_context_count(session_id)
 
         msg = f"📊 上下文状态:\n"
         msg += f"会话数: {self.ctx_mgr.get_session_count()}\n"
@@ -3486,6 +3996,7 @@ class FigurineProPlugin(Star):
         msg += f"LLM智能判断: {'已启用' if self._llm_auto_detect else '未启用'}\n"
         msg += f"上下文轮数: {self._context_rounds}\n"
         msg += f"置信度阈值: {self._auto_detect_confidence}\n"
+        msg += f"最近图片上下文: {image_context_count} 张\n"
 
         if messages:
             msg += f"\n最近 {len(messages)} 条消息:\n"
@@ -3504,6 +4015,8 @@ class FigurineProPlugin(Star):
 
         session_id = event.unified_msg_origin
         count = await self.ctx_mgr.clear_session(session_id)
+        await self._clear_session_image_cache(session_id)
+        await self._clear_session_recent_image_context(session_id)
 
         yield event.chain_result([Plain(f"✅ 已清除 {count} 条上下文记录")])
 
@@ -5306,6 +5819,8 @@ class FigurineProPlugin(Star):
             res = await self._prepare_send_image_bytes(res)
             elapsed = (datetime.now() - start).total_seconds()
             await self.data_mgr.record_usage(uid, gid)
+            await self._register_generation_success(event.unified_msg_origin, 1)
+            await self._register_generated_image(event.unified_msg_origin, res)
 
             quota_str = self._get_quota_str(deduction, uid, gid)
             timing_text = self._format_success_timing(elapsed)
