@@ -75,16 +75,17 @@ class ApiManager:
 
     async def _call_api_with_luxury_mode(self, images: List[bytes], prompt: str,
                                          model: str, proxy: str = None,
-                                         use_text_to_image_api: bool = False) -> bytes | str:
+                                         use_text_to_image_api: bool = False,
+                                         overrides: dict = None) -> bytes | str:
         """奢侈模式：同一请求并发多次，只取首个成功结果，其余丢弃。"""
         luxury_count = self._get_luxury_request_count()
         if luxury_count <= 1:
-            return await self._call_api_once(images, prompt, model, proxy, use_text_to_image_api)
+            return await self._call_api_once(images, prompt, model, proxy, use_text_to_image_api, overrides=overrides)
 
         logger.info(f"奢侈模式已启用：同一请求并发 {luxury_count} 次，仅取其中一张成功图片")
 
         tasks = [
-            asyncio.create_task(self._call_api_once(images, prompt, model, proxy, use_text_to_image_api))
+            asyncio.create_task(self._call_api_once(images, prompt, model, proxy, use_text_to_image_api, overrides=overrides))
             for _ in range(luxury_count)
         ]
 
@@ -921,26 +922,99 @@ class ApiManager:
         )
 
         if self.config.get("enable_luxury_mode", False):
-            return await self._call_api_with_luxury_mode(
+            result = await self._call_api_with_luxury_mode(
+                images, prompt, model, proxy, use_text_to_image_api
+            )
+        else:
+            result = await self._call_api_once(
                 images, prompt, model, proxy, use_text_to_image_api
             )
 
-        return await self._call_api_once(
-            images, prompt, model, proxy, use_text_to_image_api
-        )
+        # 主模型成功，直接返回
+        if isinstance(result, bytes):
+            return result
+
+        # 检查是否启用回退
+        if not self.config.get("enable_fallback", False):
+            return result
+
+        # 获取回退模型组列表
+        fallback_list = self.config.get("fallback_models", [])
+        if not fallback_list:
+            return result
+
+        logger.info(f"主模型生图失败，开始尝试回退模型组（共 {len(fallback_list)} 组）")
+        last_error = result
+
+        for idx, fb in enumerate(fallback_list):
+            fb_url = (fb.get("url") or "").strip() if isinstance(fb, dict) else ""
+            fb_key = (fb.get("key") or "").strip() if isinstance(fb, dict) else ""
+            fb_model = (fb.get("model") or "").strip() if isinstance(fb, dict) else ""
+            fb_mode = (fb.get("mode") or "generic").strip() if isinstance(fb, dict) else "generic"
+
+            if not fb_url or not fb_key or not fb_model:
+                logger.warning(f"回退模型组 {idx + 1} 配置不完整，跳过 (url/key/model 不能为空)")
+                continue
+
+            if fb_mode not in ("generic", "gemini_official"):
+                fb_mode = "generic"
+
+            overrides = {
+                "base_url": fb_url,
+                "key": fb_key,
+                "mode": fb_mode,
+            }
+
+            logger.info(f"尝试回退模型组 {idx + 1}/{len(fallback_list)}: model={fb_model}, mode={fb_mode}, url={fb_url[:60]}...")
+
+            try:
+                if self.config.get("enable_luxury_mode", False):
+                    result = await self._call_api_with_luxury_mode(
+                        images, prompt, fb_model, proxy, use_text_to_image_api, overrides=overrides
+                    )
+                else:
+                    result = await self._call_api_once(
+                        images, prompt, fb_model, proxy, use_text_to_image_api, overrides=overrides
+                    )
+            except Exception as e:
+                logger.error(f"回退模型组 {idx + 1} 异常: {e}")
+                result = f"回退模型组 {idx + 1} 异常: {e}"
+
+            if isinstance(result, bytes):
+                logger.info(f"回退模型组 {idx + 1} 成功: model={fb_model}")
+                return result
+
+            last_error = result
+            logger.warning(f"回退模型组 {idx + 1} 失败: {str(result)[:200]}")
+
+        logger.warning(f"所有回退模型组均失败，返回最后错误")
+        return last_error
 
     async def _call_api_once(self, images: List[bytes], prompt: str,
                              model: str, proxy: str = None,
-                             use_text_to_image_api: bool = False) -> bytes | str:
-        """核心生成逻辑"""
+                             use_text_to_image_api: bool = False,
+                             overrides: dict = None) -> bytes | str:
+        """核心生成逻辑
+
+        overrides: 可选的覆盖配置，用于回退模型。支持以下 key:
+            - base_url: 覆盖 API 基础地址
+            - key: 覆盖 API Key
+            - mode: 覆盖 API 模式 (generic / gemini_official)
+        """
 
         self._reset_metrics()
         call_start = asyncio.get_running_loop().time()
 
-        mode = self.config.get("api_mode", "generic")
+        # 1. 确定模式 (支持 overrides 覆盖)
+        if overrides and overrides.get("mode"):
+            mode = overrides["mode"]
+        else:
+            mode = self.config.get("api_mode", "generic")
 
-        # 1. 确定 URL
-        if use_text_to_image_api:
+        # 1. 确定 URL (支持 overrides 覆盖)
+        if overrides and overrides.get("base_url"):
+            base = overrides["base_url"]
+        elif use_text_to_image_api:
             if mode == "gemini_official":
                 base = (
                     self.config.get("text_to_image_api_url")
@@ -960,8 +1034,11 @@ class ApiManager:
         if not base:
             return "API URL 未配置"
 
-        # 2. 获取 Key
-        key = await self.get_key(mode, use_text_to_image_api=use_text_to_image_api)
+        # 2. 获取 Key (支持 overrides 覆盖)
+        if overrides and overrides.get("key"):
+            key = overrides["key"]
+        else:
+            key = await self.get_key(mode, use_text_to_image_api=use_text_to_image_api)
         if not key:
             return "无可用 API Key"
 
