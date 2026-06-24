@@ -362,6 +362,16 @@
 
 ## 📝 更新日志
 
+### v2.8.9
+
+#### 🔧 优化改进
+
+- 优化 API Manager 逻辑，增强图片下载稳定性与重试机制
+- 新增 `generic_prefer_images_api` 配置项，Generic 模式可优先直连 `images/generations` / `images/edits`
+- 新增 Images API `multipart/form-data` 自动回退支持，当服务端不接受 JSON data URI 时自动切换文件上传方式
+- 修复 Generic API 地址误填完整路径（如 `/v1/chat/completions`）的自动修正逻辑
+- 更新配置 schema，新增图片接口优先模式等相关配置项
+
 ### v1.9.0
 
 #### 🆕 新增功能
