@@ -104,6 +104,52 @@
             "4K"
         ]
     },
+    "enable_fallback": {
+        "description": "【容错】启用模型回退",
+        "type": "bool",
+        "hint": "开启后，当主模型生图失败时，会自动按顺序尝试下方配置的回退模型组，直到成功或全部尝试完毕。",
+        "default": false
+    },
+    "fallback_models": {
+        "description": "【容错】回退模型组列表",
+        "type": "template_list",
+        "hint": "生图失败后自动尝试的备选模型配置，按列表顺序逐一尝试。每组需填写API地址、Key、模型名称和API模式。",
+        "templates": {
+            "fallback": {
+                "name": "回退模型",
+                "items": {
+                    "url": {
+                        "type": "string",
+                        "description": "API基础地址",
+                        "hint": "如 https://api.example.com 或 https://generativelanguage.googleapis.com",
+                        "default": ""
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "API Key",
+                        "default": ""
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "模型名称",
+                        "hint": "如 nano-banana, gemini-2.5-flash-image 等",
+                        "default": ""
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "API模式",
+                        "hint": "generic=OpenAI通用格式, gemini_official=谷歌官方格式",
+                        "default": "generic",
+                        "options": [
+                            "generic",
+                            "gemini_official"
+                        ]
+                    }
+                }
+            }
+        },
+        "default": []
+    },
     "enable_luxury_mode": {
         "description": "【全局】启用奢侈模式",
         "type": "bool",
